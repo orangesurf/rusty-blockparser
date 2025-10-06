@@ -8,6 +8,7 @@ use crate::blockchain::proto::header::BlockHeader;
 use crate::blockchain::proto::tx::{RawTx, TxInput, TxOutpoint, TxOutput};
 use crate::blockchain::proto::varuint::VarUint;
 use crate::blockchain::proto::MerkleBranch;
+use crate::blockchain::proto::ToRaw;
 use crate::common::Result;
 use byteorder::{LittleEndian, ReadBytesExt};
 
@@ -82,16 +83,26 @@ pub trait BlockchainRead: Read {
         let out_count = VarUint::read_from(self)?;
         let outputs = self.read_tx_outputs(out_count.value)?;
 
+        // Track witness data size
+        let mut witness_size = 0u32;
+        
         // Check if the witness flag is present
         if flags & 1 > 0 {
+            witness_size += 2; // marker (0x00) and flag (0x01)
+            
             for _ in 0..in_count.value {
                 let item_count = VarUint::read_from(self)?;
+                witness_size += item_count.to_bytes().len() as u32;
+                
                 for _ in 0..item_count.value {
                     let witness_len = VarUint::read_from(self)?;
-                    let _ = self.read_u8_vec(witness_len.value as u32)?;
+                    witness_size += witness_len.to_bytes().len() as u32;
+                    let witness_data = self.read_u8_vec(witness_len.value as u32)?;
+                    witness_size += witness_data.len() as u32;
                 }
             }
         }
+        
         let locktime = self.read_u32::<LittleEndian>()?;
         let tx = RawTx {
             version,
@@ -101,6 +112,7 @@ pub trait BlockchainRead: Read {
             outputs,
             locktime,
             version_id,
+            witness_size,
         };
         Ok(tx)
     }

@@ -15,6 +15,7 @@ pub struct RawTx {
     pub outputs: Vec<TxOutput>,
     pub locktime: u32,
     pub version_id: u8,
+    pub witness_size: u32,
 }
 
 /// Simple transaction struct
@@ -26,6 +27,7 @@ pub struct EvaluatedTx {
     pub out_count: VarUint,
     pub outputs: Vec<EvaluatedTxOut>,
     pub locktime: u32,
+    pub witness_size: u32,
 }
 
 impl EvaluatedTx {
@@ -37,6 +39,7 @@ impl EvaluatedTx {
         outputs: Vec<TxOutput>,
         locktime: u32,
         version_id: u8,
+        witness_size: u32,
     ) -> Self {
         // Evaluate and wrap all outputs to process them later
         let outputs = outputs
@@ -50,7 +53,13 @@ impl EvaluatedTx {
             out_count,
             outputs,
             locktime,
-        }
+            witness_size,
+        }        
+    }
+
+    pub fn vsize(&self) -> f64 {
+        let base_size = self.to_bytes().len() as f64;
+        base_size + (self.witness_size as f64 / 4.0)
     }
 
     #[inline]
@@ -85,6 +94,7 @@ impl From<RawTx> for EvaluatedTx {
             tx.outputs,
             tx.locktime,
             tx.version_id,
+            tx.witness_size,
         )
     }
 }

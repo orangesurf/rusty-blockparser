@@ -15,6 +15,7 @@ use crate::callbacks::simplestats::SimpleStats;
 use crate::callbacks::unspentcsvdump::UnspentCsvDump;
 use crate::common::logger::SimpleLogger;
 use crate::common::{Result, utils};
+use crate::callbacks::lowfee::LowFee;
 
 #[macro_use]
 extern crate log;
@@ -129,6 +130,7 @@ fn command() -> Command {
     .subcommand(SimpleStats::build_subcommand())
     .subcommand(Balances::build_subcommand())
     .subcommand(OpReturn::build_subcommand())
+    .subcommand(LowFee::build_subcommand())
 }
 
 fn main() {
@@ -209,6 +211,7 @@ fn parse_args(matches: clap::ArgMatches) -> Result<ParserOptions> {
         Some(("unspentcsvdump", matches)) => Box::new(UnspentCsvDump::new(matches)?),
         Some(("balances", matches)) => Box::new(Balances::new(matches)?),
         Some(("opreturn", matches)) => Box::new(OpReturn::new(matches)?),
+        Some(("lowfee", matches)) => Box::new(LowFee::new(matches)?),
         _ => {
             clap::error::Error::<clap::error::DefaultFormatter>::raw(
                 clap::error::ErrorKind::MissingSubcommand,
