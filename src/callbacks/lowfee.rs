@@ -1,5 +1,5 @@
 use clap::{ArgMatches, Command, Arg};
-use std::collections::HashMap;
+use fxhash::FxHashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -11,7 +11,7 @@ use crate::common::Result;
 
 pub struct LowFee {
     writer: BufWriter<File>,
-    unspents: HashMap<Vec<u8>, common::UnspentValue>,
+    unspents: FxHashMap<[u8; 36], common::UnspentValue>,
 }
 
 impl Callback for LowFee {
@@ -38,18 +38,20 @@ impl Callback for LowFee {
     {
         let output_path = PathBuf::from(matches.get_one::<String>("output").unwrap());
         let file = File::create(output_path)?;
-        let mut writer = BufWriter::with_capacity(4096, file);
+        // Larger buffer for better I/O performance
+        let mut writer = BufWriter::with_capacity(1_048_576, file);
         
-        writeln!(writer, "block_height,block_timestamp,txid,fee_sats,size_vb,fee_rate")?;
+        writeln!(&mut writer, "block_height,block_timestamp,txid,fee_sats,size_vb,fee_rate")?;
         
         Ok(LowFee {
             writer,
-            unspents: HashMap::with_capacity(10000000),
+            // Pre-allocate for peak UTXO count to avoid reallocations
+            unspents: FxHashMap::with_capacity_and_hasher(200_000_000, Default::default()),
         })
     }
 
     fn on_start(&mut self, _: u64) -> Result<()> {
-        info!(target: "callback", "Executing LowFee ...");
+        info!(target: "callback", "Executing LowFee with optimized memory usage...");
         Ok(())
     }
 
@@ -57,16 +59,15 @@ impl Callback for LowFee {
         let block_timestamp = block.header.value.timestamp;
         
         for tx in &block.txs {
-            // Skip coinbase transactions (they don't have fees in the traditional sense)
             if tx.value.is_coinbase() {
-                common::insert_unspents(tx, block_height, &mut self.unspents);
+                self.insert_unspents(tx, block_height);
                 continue;
             }
             
             // Calculate input value by looking up UTXOs
             let mut input_value: u64 = 0;
             for input in &tx.value.inputs {
-                let key = input.outpoint.to_bytes();
+                let key = self.outpoint_to_key(&input.outpoint);
                 if let Some(unspent) = self.unspents.get(&key) {
                     input_value += unspent.value;
                 }
@@ -101,18 +102,52 @@ impl Callback for LowFee {
             }
             
             // Update UTXO set
-            common::remove_unspents(tx, &mut self.unspents);
-            common::insert_unspents(tx, block_height, &mut self.unspents);
+            self.remove_unspents(tx);
+            self.insert_unspents(tx, block_height);
         }
         Ok(())
     }
 
     fn on_complete(&mut self, _: u64) -> Result<()> {
         self.writer.flush()?;
+        info!(target: "callback", "Peak UTXO count: {}", self.unspents.len());
         Ok(())
     }
 
     fn show_progress(&self) -> bool {
-        false
+        true
+    }
+}
+
+impl LowFee {
+    // Convert TxOutpoint to fixed-size key (saves 24 bytes per entry vs Vec<u8>)
+    #[inline]
+    fn outpoint_to_key(&self, outpoint: &crate::blockchain::proto::tx::TxOutpoint) -> [u8; 36] {
+        let bytes = outpoint.to_bytes();
+        let mut key = [0u8; 36];
+        key.copy_from_slice(&bytes);
+        key
+    }
+    
+    fn remove_unspents(&mut self, tx: &crate::blockchain::proto::Hashed<crate::blockchain::proto::tx::EvaluatedTx>) {
+        for input in &tx.value.inputs {
+            let key = self.outpoint_to_key(&input.outpoint);
+            self.unspents.remove(&key);
+        }
+    }
+    
+    fn insert_unspents(&mut self, tx: &crate::blockchain::proto::Hashed<crate::blockchain::proto::tx::EvaluatedTx>, block_height: u64) {
+        for (i, output) in tx.value.outputs.iter().enumerate() {
+            if let Some(address) = &output.script.address {
+                let unspent = common::UnspentValue {
+                    block_height,
+                    value: output.out.value,
+                    address: address.clone(),
+                };
+                let outpoint = crate::blockchain::proto::tx::TxOutpoint::new(tx.hash, i as u32);
+                let key = self.outpoint_to_key(&outpoint);
+                self.unspents.insert(key, unspent);
+            }
+        }
     }
 }
