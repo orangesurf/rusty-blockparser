@@ -5,13 +5,20 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
 use crate::blockchain::proto::block::Block;
+use crate::blockchain::proto::tx::TxOutpoint;
 use crate::blockchain::proto::ToRaw;
-use crate::callbacks::{Callback, common};
+use crate::callbacks::Callback;
 use crate::common::Result;
+
+// Minimal struct - only store what we need for fee calculation
+#[derive(Clone)]
+struct Unspent {
+    value: u64,
+}
 
 pub struct LowFee {
     writer: BufWriter<File>,
-    unspents: FxHashMap<[u8; 36], common::UnspentValue>,
+    unspents: FxHashMap<[u8; 36], Unspent>,
 }
 
 impl Callback for LowFee {
@@ -38,20 +45,18 @@ impl Callback for LowFee {
     {
         let output_path = PathBuf::from(matches.get_one::<String>("output").unwrap());
         let file = File::create(output_path)?;
-        // Larger buffer for better I/O performance
         let mut writer = BufWriter::with_capacity(1_048_576, file);
         
         writeln!(&mut writer, "block_height,block_timestamp,txid,fee_sats,size_vb,fee_rate")?;
         
         Ok(LowFee {
             writer,
-            // Pre-allocate for peak UTXO count to avoid reallocations
             unspents: FxHashMap::with_capacity_and_hasher(200_000_000, Default::default()),
         })
     }
 
     fn on_start(&mut self, _: u64) -> Result<()> {
-        info!(target: "callback", "Executing LowFee with optimized memory usage...");
+        info!(target: "callback", "Executing LowFee with minimal memory footprint...");
         Ok(())
     }
 
@@ -59,15 +64,22 @@ impl Callback for LowFee {
         let block_timestamp = block.header.value.timestamp;
         
         for tx in &block.txs {
+            // Process coinbase - only add outputs, no inputs to remove
             if tx.value.is_coinbase() {
-                self.insert_unspents(tx, block_height);
+                for (i, output) in tx.value.outputs.iter().enumerate() {
+                    if output.script.address.is_some() {
+                        let outpoint = TxOutpoint::new(tx.hash, i as u32);
+                        let key = Self::outpoint_to_key(&outpoint);
+                        self.unspents.insert(key, Unspent { value: output.out.value });
+                    }
+                }
                 continue;
             }
             
             // Calculate input value by looking up UTXOs
             let mut input_value: u64 = 0;
             for input in &tx.value.inputs {
-                let key = self.outpoint_to_key(&input.outpoint);
+                let key = Self::outpoint_to_key(&input.outpoint);
                 if let Some(unspent) = self.unspents.get(&key) {
                     input_value += unspent.value;
                 }
@@ -85,7 +97,11 @@ impl Callback for LowFee {
             let size_vb = tx.value.vsize();
             
             // Calculate fee rate
-            let fee_rate = fee as f64 / size_vb;
+            let fee_rate = if size_vb > 0.0 {
+                fee as f64 / size_vb
+            } else {
+                0.0
+            };
             
             // Write if sub-1 sat/vB
             if fee_rate < 1.0 {
@@ -101,9 +117,20 @@ impl Callback for LowFee {
                 )?;
             }
             
-            // Update UTXO set
-            self.remove_unspents(tx);
-            self.insert_unspents(tx, block_height);
+            // Remove spent outputs
+            for input in &tx.value.inputs {
+                let key = Self::outpoint_to_key(&input.outpoint);
+                self.unspents.remove(&key);
+            }
+            
+            // Add new outputs
+            for (i, output) in tx.value.outputs.iter().enumerate() {
+                if output.script.address.is_some() {
+                    let outpoint = TxOutpoint::new(tx.hash, i as u32);
+                    let key = Self::outpoint_to_key(&outpoint);
+                    self.unspents.insert(key, Unspent { value: output.out.value });
+                }
+            }
         }
         Ok(())
     }
@@ -120,34 +147,12 @@ impl Callback for LowFee {
 }
 
 impl LowFee {
-    // Convert TxOutpoint to fixed-size key (saves 24 bytes per entry vs Vec<u8>)
+    // Convert TxOutpoint to fixed-size key
     #[inline]
-    fn outpoint_to_key(&self, outpoint: &crate::blockchain::proto::tx::TxOutpoint) -> [u8; 36] {
+    fn outpoint_to_key(outpoint: &TxOutpoint) -> [u8; 36] {
         let bytes = outpoint.to_bytes();
         let mut key = [0u8; 36];
         key.copy_from_slice(&bytes);
         key
-    }
-    
-    fn remove_unspents(&mut self, tx: &crate::blockchain::proto::Hashed<crate::blockchain::proto::tx::EvaluatedTx>) {
-        for input in &tx.value.inputs {
-            let key = self.outpoint_to_key(&input.outpoint);
-            self.unspents.remove(&key);
-        }
-    }
-    
-    fn insert_unspents(&mut self, tx: &crate::blockchain::proto::Hashed<crate::blockchain::proto::tx::EvaluatedTx>, block_height: u64) {
-        for (i, output) in tx.value.outputs.iter().enumerate() {
-            if let Some(address) = &output.script.address {
-                let unspent = common::UnspentValue {
-                    block_height,
-                    value: output.out.value,
-                    address: address.clone(),
-                };
-                let outpoint = crate::blockchain::proto::tx::TxOutpoint::new(tx.hash, i as u32);
-                let key = self.outpoint_to_key(&outpoint);
-                self.unspents.insert(key, unspent);
-            }
-        }
     }
 }
