@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use crate::blockchain::proto::block::Block;
 use crate::blockchain::proto::script::ScriptPattern;
+use crate::blockchain::proto::ToRaw;
 use crate::callbacks::Callback;
 use crate::common::Result;
 
@@ -41,7 +42,7 @@ impl Callback for OpReturn {
         // Write CSV header
         writeln!(
             writer,
-            "block_height,block_timestamp,txid,tx_output_index,is_push_only,is_one_data_push,data_length,total_bytes_after_return,prefix_hex,is_coinbase"
+            "block_height,block_timestamp,txid,tx_output_index,is_push_only,is_one_data_push,data_length,total_bytes_after_return,prefix_hex,is_coinbase,tx_weight"
         )?;
         
         Ok(OpReturn { writer })
@@ -57,6 +58,17 @@ impl Callback for OpReturn {
 
         for tx in &block.txs {
             let is_coinbase = tx.value.is_coinbase();
+            // Check if this tx has any OP_RETURN outputs before computing weight
+            let has_opreturn = tx.value.outputs.iter().any(|o| {
+                matches!(&o.script.pattern, ScriptPattern::OpReturn(_))
+            });
+            let tx_weight = if has_opreturn {
+                let base_size = tx.value.to_bytes().len() as u64;
+                base_size * 4 + tx.value.witness_size as u64
+            } else {
+                0
+            };
+
             for (output_index, out) in tx.value.outputs.iter().enumerate() {
                 if let ScriptPattern::OpReturn(_) = &out.script.pattern {
                     let script_bytes = &out.out.script_pubkey;
@@ -73,7 +85,7 @@ impl Callback for OpReturn {
 
                     writeln!(
                         self.writer,
-                        "{},{},{},{},{},{},{},{},{},{}",
+                        "{},{},{},{},{},{},{},{},{},{},{}",
                         block_height,
                         block_timestamp,
                         &tx.hash,
@@ -83,7 +95,8 @@ impl Callback for OpReturn {
                         data_length_str,
                         total_bytes,
                         prefix_hex,
-                        is_coinbase
+                        is_coinbase,
+                        tx_weight
                     )?;
                 }
             }
