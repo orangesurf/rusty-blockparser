@@ -7,3 +7,6 @@ csvdump
 scripts/
 debug.sh
 dump/
+
+# Large output CSVs
+output-*.csv

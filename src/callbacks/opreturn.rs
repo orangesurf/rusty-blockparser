@@ -41,7 +41,7 @@ impl Callback for OpReturn {
         // Write CSV header
         writeln!(
             writer,
-            "block_height,block_timestamp,txid,tx_output_index,is_push_only,is_one_data_push,data_length,total_bytes_after_return"
+            "block_height,block_timestamp,txid,tx_output_index,is_push_only,is_one_data_push,data_length,total_bytes_after_return,prefix_hex,is_coinbase"
         )?;
         
         Ok(OpReturn { writer })
@@ -54,23 +54,26 @@ impl Callback for OpReturn {
 
     fn on_block(&mut self, block: &Block, block_height: u64) -> Result<()> {
         let block_timestamp = block.header.value.timestamp;
-        
+
         for tx in &block.txs {
+            let is_coinbase = tx.value.is_coinbase();
             for (output_index, out) in tx.value.outputs.iter().enumerate() {
                 if let ScriptPattern::OpReturn(_) = &out.script.pattern {
                     let script_bytes = &out.out.script_pubkey;
-                    
-                    let (is_push_only, is_one_data_push, data_length, total_bytes) = 
+
+                    let (is_push_only, is_one_data_push, data_length, total_bytes) =
                         analyze_op_return_script(script_bytes);
-                    
+
                     let data_length_str = match data_length {
                         Some(len) => len.to_string(),
                         None => String::new(),
                     };
-                    
+
+                    let prefix_hex = extract_data_prefix_hex(script_bytes);
+
                     writeln!(
                         self.writer,
-                        "{},{},{},{},{},{},{},{}",
+                        "{},{},{},{},{},{},{},{},{},{}",
                         block_height,
                         block_timestamp,
                         &tx.hash,
@@ -78,7 +81,9 @@ impl Callback for OpReturn {
                         is_push_only,
                         is_one_data_push,
                         data_length_str,
-                        total_bytes
+                        total_bytes,
+                        prefix_hex,
+                        is_coinbase
                     )?;
                 }
             }
@@ -94,6 +99,104 @@ impl Callback for OpReturn {
     fn show_progress(&self) -> bool {
         false
     }
+}
+
+/// Extract the first 20 bytes of pushed DATA from the first push after OP_RETURN.
+/// Returns hex-encoded string (up to 40 hex chars). Strips push opcodes.
+/// Special case: OP_13 (0x5d) is treated as a 1-byte Runes protocol tag,
+/// followed by data from subsequent pushes (up to 19 more bytes).
+fn extract_data_prefix_hex(script_bytes: &[u8]) -> String {
+    let op_return_pos = match script_bytes.iter().position(|&b| b == 0x6a) {
+        Some(p) => p,
+        None => return String::new(),
+    };
+    let after = &script_bytes[op_return_pos + 1..];
+    if after.is_empty() {
+        return String::new();
+    }
+
+    let mut data_bytes: Vec<u8> = Vec::with_capacity(20);
+
+    // OP_13 (0x5d) = Runes protocol tag: include the byte, then extract from subsequent pushes
+    if after[0] == 0x5d {
+        data_bytes.push(0x5d);
+        let mut pos = 1;
+        while pos < after.len() && data_bytes.len() < 20 {
+            let opcode = after[pos];
+            match opcode {
+                0x01..=0x4b => {
+                    let len = opcode as usize;
+                    let start = pos + 1;
+                    let end = std::cmp::min(start + len, after.len());
+                    let take = std::cmp::min(end - start, 20 - data_bytes.len());
+                    data_bytes.extend_from_slice(&after[start..start + take]);
+                    pos = start + len;
+                }
+                0x4c => {
+                    if pos + 1 >= after.len() { break; }
+                    let len = after[pos + 1] as usize;
+                    let start = pos + 2;
+                    let end = std::cmp::min(start + len, after.len());
+                    let take = std::cmp::min(end - start, 20 - data_bytes.len());
+                    data_bytes.extend_from_slice(&after[start..start + take]);
+                    pos = start + len;
+                }
+                0x4d => {
+                    if pos + 2 >= after.len() { break; }
+                    let len = u16::from_le_bytes([after[pos + 1], after[pos + 2]]) as usize;
+                    let start = pos + 3;
+                    let end = std::cmp::min(start + len, after.len());
+                    let take = std::cmp::min(end - start, 20 - data_bytes.len());
+                    data_bytes.extend_from_slice(&after[start..start + take]);
+                    pos = start + len;
+                }
+                0x4e => {
+                    if pos + 4 >= after.len() { break; }
+                    let len = u32::from_le_bytes([
+                        after[pos + 1], after[pos + 2], after[pos + 3], after[pos + 4]
+                    ]) as usize;
+                    let start = pos + 5;
+                    let end = std::cmp::min(start + len, after.len());
+                    let take = std::cmp::min(end - start, 20 - data_bytes.len());
+                    data_bytes.extend_from_slice(&after[start..start + take]);
+                    pos = start + len;
+                }
+                0x00 | 0x4f..=0x60 => {
+                    // OP_0 or number opcodes — skip, no data
+                    pos += 1;
+                }
+                _ => break, // non-push opcode
+            }
+        }
+    } else {
+        // Standard first-push extraction
+        let first = after[0];
+        let (data_start, data_len) = match first {
+            0x01..=0x4b => (1usize, first as usize),
+            0x4c => {
+                if after.len() < 2 { return String::new(); }
+                (2, after[1] as usize)
+            }
+            0x4d => {
+                if after.len() < 3 { return String::new(); }
+                (3, u16::from_le_bytes([after[1], after[2]]) as usize)
+            }
+            0x4e => {
+                if after.len() < 5 { return String::new(); }
+                (5, u32::from_le_bytes([after[1], after[2], after[3], after[4]]) as usize)
+            }
+            _ => return String::new(), // number opcodes or other — no extractable data
+        };
+        let available = after.len() - data_start;
+        let actual_len = std::cmp::min(data_len, available);
+        let take = std::cmp::min(actual_len, 20);
+        data_bytes.extend_from_slice(&after[data_start..data_start + take]);
+    }
+
+    if data_bytes.is_empty() {
+        return String::new();
+    }
+    data_bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 /// Analyzes OP_RETURN script to determine compliance with Bitcoin Core policies
