@@ -1,3 +1,7 @@
+./target/release/rusty-blockparser -d "/Users/orangesurf/Library/Application Support/Bitcoin/blocks/" opreturn ../data/output-opreturn.csv
+
+... Processed blocks up to height 917319 in 68.46 minutes.
+
 # rusty-blockparser
 
 **rusty-blockparser** is a Bitcoin Blockchain Parser that enables data extraction of various types (e.g.:
